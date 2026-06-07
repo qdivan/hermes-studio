@@ -1,0 +1,19 @@
+{
+  "name": "@hermes-web-ui/ekko-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local development agent for Ekko experiments inside Hermes Web UI.",
+  "type": "module",
+  "bin": {
+    "ekko-agent": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=23.0.0"
+  },
+  "scripts": {
+    "build": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json",
+    "check": "npm run build",
+    "dev": "npm run build && node dist/cli.js",
+    "start": "node dist/cli.js"
+  }
+}
