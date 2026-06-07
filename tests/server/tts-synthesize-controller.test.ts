@@ -5,6 +5,7 @@ function createMockCtx(body: Record<string, any> = {}) {
   let closeHandler: (() => void) | undefined
 
   const ctx: any = {
+    state: { user: { id: 7, username: 'han', role: 'super_admin' } },
     request: { body },
     req: {
       on: vi.fn((event: string, handler: () => void) => {
@@ -50,6 +51,13 @@ describe('tts synthesize controller', () => {
     vi.clearAllMocks()
     vi.doUnmock('../../packages/server/src/services/hermes/tts-providers')
     vi.doUnmock('../../packages/server/src/controllers/hermes/tts')
+    vi.doMock('../../packages/server/src/db/hermes/tts-settings-store', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../packages/server/src/db/hermes/tts-settings-store')>()
+      return {
+        ...actual,
+        getTtsProviderConfigForSynthesis: vi.fn(() => null),
+      }
+    })
   })
 
   it('returns 400 for an unknown provider', async () => {
@@ -63,7 +71,7 @@ describe('tts synthesize controller', () => {
 
     await ctrl.synthesize(ctx)
 
-    expect(getTtsProvider).toHaveBeenCalledWith('nope')
+    expect(getTtsProvider).not.toHaveBeenCalled()
     expect(ctx.status).toBe(400)
     expect(ctx.body).toEqual({ error: 'unknown TTS provider' })
   })
@@ -147,6 +155,130 @@ describe('tts synthesize controller', () => {
     expect(ctx.body).toBe(audio)
   })
 
+  it('loads stored provider config and lets non-secret request options override settings', async () => {
+    const audio = Buffer.from('openai-audio')
+    const provider = {
+      synthesize: vi.fn().mockResolvedValue({
+        audio,
+        contentType: 'audio/mpeg',
+        engine: 'openai',
+        provider: 'openai',
+      }),
+    }
+    vi.doMock('../../packages/server/src/services/hermes/tts-providers', () => ({
+      getTtsProvider: vi.fn(() => provider),
+    }))
+    const store = await import('../../packages/server/src/db/hermes/tts-settings-store')
+    vi.mocked(store.getTtsProviderConfigForSynthesis).mockReturnValue({
+      provider: 'openai',
+      settings: { baseUrl: 'https://api.openai.com/v1', model: 'tts-1', voice: 'alloy' },
+      secrets: { apiKey: 'server-side-key' },
+    })
+
+    const ctrl = await import('../../packages/server/src/controllers/hermes/tts')
+    const { ctx } = createMockCtx({
+      provider: 'openai',
+      text: 'Hello world',
+      options: { voice: 'verse' },
+    })
+
+    await ctrl.synthesize(ctx)
+
+    expect(store.getTtsProviderConfigForSynthesis).toHaveBeenCalledWith(7, 'openai')
+    expect(provider.synthesize).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello world' }),
+      expect.objectContaining({
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'tts-1',
+        voice: 'verse',
+        apiKey: 'server-side-key',
+      }),
+    )
+  })
+
+  it('does not let client baseUrl override a stored secret boundary', async () => {
+    const provider = {
+      synthesize: vi.fn().mockResolvedValue({
+        audio: Buffer.from('openai-audio'),
+        contentType: 'audio/mpeg',
+        engine: 'openai',
+        provider: 'openai',
+      }),
+    }
+    vi.doMock('../../packages/server/src/services/hermes/tts-providers', () => ({
+      getTtsProvider: vi.fn(() => provider),
+    }))
+    const store = await import('../../packages/server/src/db/hermes/tts-settings-store')
+    vi.mocked(store.getTtsProviderConfigForSynthesis).mockReturnValue({
+      provider: 'openai',
+      settings: { baseUrl: 'https://trusted.example/v1', model: 'tts-1', voice: 'alloy' },
+      secrets: { apiKey: 'server-side-key' },
+    })
+
+    const ctrl = await import('../../packages/server/src/controllers/hermes/tts')
+    const { ctx } = createMockCtx({
+      provider: 'openai',
+      text: 'Hello world',
+      options: {
+        baseUrl: 'https://attacker.example/v1',
+        voice: 'verse',
+      },
+    })
+
+    await ctrl.synthesize(ctx)
+
+    expect(provider.synthesize).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello world' }),
+      expect.objectContaining({
+        baseUrl: 'https://trusted.example/v1',
+        voice: 'verse',
+        apiKey: 'server-side-key',
+      }),
+    )
+    expect(JSON.stringify(provider.synthesize.mock.calls[0][1])).not.toContain('attacker.example')
+  })
+
+  it('ignores client-supplied secret fields during protected synthesis', async () => {
+    const provider = {
+      synthesize: vi.fn().mockResolvedValue({
+        audio: Buffer.from('mimo-audio'),
+        contentType: 'audio/mpeg',
+        engine: 'mimo',
+        provider: 'mimo',
+      }),
+    }
+    vi.doMock('../../packages/server/src/services/hermes/tts-providers', () => ({
+      getTtsProvider: vi.fn(() => provider),
+    }))
+    const store = await import('../../packages/server/src/db/hermes/tts-settings-store')
+    vi.mocked(store.getTtsProviderConfigForSynthesis).mockReturnValue({
+      provider: 'mimo',
+      settings: { authMode: 'both' },
+      secrets: { apiKey: 'server-key', voiceCloneDataUri: 'data:audio/wav;base64,ZmFrZQ==' },
+    })
+
+    const ctrl = await import('../../packages/server/src/controllers/hermes/tts')
+    const { ctx } = createMockCtx({
+      provider: 'mimo',
+      text: 'Hello world',
+      options: {
+        apiKey: 'client-key',
+        voiceCloneDataUri: 'client-clone-data',
+        voiceCloneFileName: 'client.wav',
+        voice: 'mimo-voice',
+      },
+    })
+
+    await ctrl.synthesize(ctx)
+
+    const options = provider.synthesize.mock.calls[0][1]
+    expect(options.apiKey).toBe('server-key')
+    expect(options.voiceCloneDataUri).toBe('data:audio/wav;base64,ZmFrZQ==')
+    expect(options.voiceCloneFileName).toBeUndefined()
+    expect(JSON.stringify(options)).not.toContain('client-key')
+    expect(JSON.stringify(options)).not.toContain('client-clone-data')
+  })
+
   it('aborts the provider signal when the request closes', async () => {
     const audio = Buffer.from('late-audio')
     let capturedSignal: AbortSignal | undefined
@@ -206,9 +338,9 @@ describe('tts synthesize controller', () => {
     expect(JSON.stringify(ctx.body)).not.toContain('client went away')
   })
 
-  it('returns 502 without leaking upstream details when the provider fails', async () => {
+  it('returns 502 with sanitized provider details when the provider fails', async () => {
     const provider = {
-      synthesize: vi.fn().mockRejectedValue(new Error('MiMo TTS returned 401: secret body')),
+      synthesize: vi.fn().mockRejectedValue(new Error('MiMo TTS returned 401: Bearer sk-secret-token invalid')),
     }
     const getTtsProvider = vi.fn(() => provider)
     vi.doMock('../../packages/server/src/services/hermes/tts-providers', () => ({
@@ -221,8 +353,40 @@ describe('tts synthesize controller', () => {
     await ctrl.synthesize(ctx)
 
     expect(ctx.status).toBe(502)
-    expect(ctx.body).toEqual({ error: 'TTS synthesis failed' })
-    expect(JSON.stringify(ctx.body)).not.toContain('secret body')
+    expect(ctx.body).toEqual({ error: 'TTS synthesis failed: MiMo TTS returned 401: Bearer [REDACTED] invalid' })
+    expect(JSON.stringify(ctx.body)).toContain('MiMo TTS returned 401')
+    expect(JSON.stringify(ctx.body)).not.toContain('sk-secret-token')
+  })
+
+  it('redacts stored MiMo clone audio when upstream echoes audio.voice', async () => {
+    vi.doMock('../../packages/server/src/db/hermes/tts-settings-store', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../packages/server/src/db/hermes/tts-settings-store')>()
+      return {
+        ...actual,
+        getTtsProviderConfigForSynthesis: vi.fn(() => ({
+          settings: {},
+          secrets: { voiceCloneDataUri: 'data:audio/wav;base64,ZmFrZQ==' },
+        })),
+      }
+    })
+
+    const provider = {
+      synthesize: vi.fn().mockRejectedValue(new Error('MiMo TTS returned 400: {"audio":{"voice":"ZmFrZQ=="}}')),
+    }
+    const getTtsProvider = vi.fn(() => provider)
+    vi.doMock('../../packages/server/src/services/hermes/tts-providers', () => ({
+      getTtsProvider,
+    }))
+
+    const ctrl = await import('../../packages/server/src/controllers/hermes/tts')
+    const { ctx } = createMockCtx({ provider: 'mimo', text: 'Hello world' })
+
+    await ctrl.synthesize(ctx)
+
+    expect(ctx.status).toBe(502)
+    expect(ctx.body).toEqual({ error: 'TTS synthesis failed: MiMo TTS returned 400: {"audio":{"voice":"[REDACTED]"}}' })
+    expect(JSON.stringify(ctx.body)).not.toContain('ZmFrZQ==')
+    expect(JSON.stringify(ctx.body)).not.toContain('data:audio/wav')
   })
 })
 
@@ -238,11 +402,17 @@ describe('tts routes', () => {
     const generate = vi.fn(async (ctx: any) => { ctx.body = { route: 'generate' } })
     const openaiProxy = vi.fn(async (ctx: any) => { ctx.body = { route: 'openaiProxy' } })
     const synthesize = vi.fn(async (ctx: any) => { ctx.body = { route: 'synthesize' } })
+    const listSettings = vi.fn(async (ctx: any) => { ctx.body = { route: 'listSettings' } })
+    const saveSettings = vi.fn(async (ctx: any) => { ctx.body = { route: 'saveSettings' } })
+    const deleteSecret = vi.fn(async (ctx: any) => { ctx.body = { route: 'deleteSecret' } })
 
     vi.doMock('../../packages/server/src/controllers/hermes/tts', () => ({
       generate,
       openaiProxy,
       synthesize,
+      listSettings,
+      saveSettings,
+      deleteSecret,
     }))
 
     const { ttsRoutes, ttsProtectedRoutes } = await import('../../packages/server/src/routes/hermes/tts')
@@ -254,7 +424,12 @@ describe('tts routes', () => {
       '/api/tts/proxy/audio/speech',
     ]))
     expect(paths).not.toContain('/api/hermes/tts/synthesize')
-    expect(protectedPaths).toEqual(['/api/hermes/tts/synthesize'])
+    expect(protectedPaths).toEqual(expect.arrayContaining([
+      '/api/hermes/tts/settings',
+      '/api/hermes/tts/settings/:provider',
+      '/api/hermes/tts/settings/:provider/secret/:secretName',
+      '/api/hermes/tts/synthesize',
+    ]))
 
     const synthLayer: any = ttsProtectedRoutes.stack.find((entry: any) => entry.path === '/api/hermes/tts/synthesize')
     const ctx: any = { request: { body: {} }, body: null }

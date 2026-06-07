@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { mimoTtsProvider } from '../../packages/server/src/services/hermes/tts-providers/mimo'
+import { setTtsDnsLookupForTests } from '../../packages/server/src/services/hermes/tts-providers/url-safety'
 
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
@@ -56,6 +57,7 @@ function getJsonBody() {
 describe('mimoTtsProvider', () => {
   beforeEach(() => {
     mockFetch.mockReset()
+    setTtsDnsLookupForTests(vi.fn(async () => [{ address: '93.184.216.34', family: 4 }]) as any)
   })
 
   it('bearer mode calls /chat/completions, sends Authorization bearer, and returns decoded audio buffer', async () => {
@@ -87,13 +89,13 @@ describe('mimoTtsProvider', () => {
     expect(url).toBe('https://mimo.example.com/chat/completions')
     expect(init?.method).toBe('POST')
     expect(init?.signal).toBe(signal)
+    expect(init?.redirect).toBe('manual')
     expect(getHeader(init?.headers, 'Authorization')).toBe('Bearer secret')
     expect(getHeader(init?.headers, 'api-key')).toBeUndefined()
 
     expect(getJsonBody()).toEqual({
       model: 'mimo-v2.5-tts',
       messages: [
-        { role: 'user', content: '' },
         { role: 'assistant', content: 'Hello world' },
       ],
       audio: { format: 'wav', voice: 'alloy' },
@@ -191,7 +193,7 @@ describe('mimoTtsProvider', () => {
     expect(body.messages[1]).toEqual({ role: 'assistant', content: 'Narrate this' })
   })
 
-  it('voiceClone model infers voiceClone mode and includes input_audio payload without audio.voice', async () => {
+  it('voiceClone model infers voiceClone mode and sends the reference audio through audio.voice', async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse({
       choices: [{ message: { audio: { data: Buffer.from('ok').toString('base64') } } }],
     }))
@@ -209,20 +211,11 @@ describe('mimoTtsProvider', () => {
     )
 
     const body = getJsonBody()
-    expect(body.audio).toEqual({ format: 'wav' })
+    expect(body.audio).toEqual({ format: 'wav', voice: 'ZmFrZQ==' })
     expect(body.messages).toEqual([
       {
         role: 'user',
-        content: [
-          { type: 'text', text: 'Match the cadence of the reference audio.' },
-          {
-            type: 'input_audio',
-            input_audio: {
-              data: 'data:audio/wav;base64,ZmFrZQ==',
-              format: 'mp3',
-            },
-          },
-        ],
+        content: 'Match the cadence of the reference audio.',
       },
       {
         role: 'assistant',
@@ -282,7 +275,7 @@ describe('mimoTtsProvider', () => {
     expect(mockFetch).not.toHaveBeenCalled()
   })
 
-  it('voiceClone mode includes voiceCloneDataUri in payload and assistant message content is synthesis text', async () => {
+  it('voiceClone mode includes voiceCloneDataUri in audio.voice and assistant message content is synthesis text', async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse({
       choices: [{ message: { audio: { data: Buffer.from('ok').toString('base64') } } }],
     }))
@@ -300,20 +293,11 @@ describe('mimoTtsProvider', () => {
     )
 
     const body = getJsonBody()
-    expect(body.audio).toEqual({ format: 'wav' })
+    expect(body.audio).toEqual({ format: 'wav', voice: 'ZmFrZQ==' })
     expect(body.messages).toEqual([
       {
         role: 'user',
-        content: [
-          { type: 'text', text: 'Match the cadence of the reference audio.' },
-          {
-            type: 'input_audio',
-            input_audio: {
-              data: 'data:audio/wav;base64,ZmFrZQ==',
-              format: 'wav',
-            },
-          },
-        ],
+        content: 'Match the cadence of the reference audio.',
       },
       {
         role: 'assistant',

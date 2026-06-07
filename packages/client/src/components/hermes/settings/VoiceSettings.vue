@@ -4,6 +4,8 @@ import { NSelect, NInput, NButton, NSlider } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { useVoiceSettings } from '@/composables/useVoiceSettings'
 import { useSpeech } from '@/composables/useSpeech'
+import { clearTtsSecret, saveTtsSettings } from '@/api/hermes/tts-settings'
+import type { StoredTtsProvider, TtsStoredSecretsInput, TtsStoredSettings } from '@/api/hermes/tts-settings'
 import { speedToEdgeRate, hzToEdgePitch } from '@/utils/ttsHelpers'
 import SettingRow from './SettingRow.vue'
 
@@ -119,13 +121,11 @@ function buildMimoTtsOptions() {
   const voiceMode = getMimoVoiceMode()
   return {
     baseUrl: vs.mimoBaseUrl.value,
-    apiKey: vs.mimoApiKey.value,
     authMode: vs.mimoAuthMode.value,
     model: vs.mimoModel.value,
     voiceMode,
     voice: voiceMode === 'preset' ? vs.mimoVoice.value : undefined,
     voiceDesignDesc: voiceMode === 'voiceDesign' ? vs.mimoVoiceDesignDesc.value || undefined : undefined,
-    voiceCloneDataUri: voiceMode === 'voiceClone' ? vs.mimoVoiceCloneDataUri.value || undefined : undefined,
     voiceCloneFormat: voiceMode === 'voiceClone' ? vs.mimoVoiceCloneFormat.value : undefined,
     stylePrompt: vs.mimoStylePrompt.value || undefined,
   }
@@ -141,9 +141,13 @@ function readFileAsDataUri(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => resolve(String(reader.result || ''))
-    reader.onerror = () => reject(reader.error || new Error('Failed to read audio file'))
+    reader.onerror = () => reject(reader.error || new Error(t('settings.voice.mimoCloneAudioReadFailed')))
     reader.readAsDataURL(file)
   })
+}
+
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
 async function handleMimoCloneAudioChange(event: Event) {
@@ -159,31 +163,171 @@ async function handleMimoCloneAudioChange(event: Event) {
     || lowerName.endsWith('.mp3')
   if (!validType) {
     console.warn('[VoiceSettings] MiMo clone audio must be mp3 or wav')
+    settingsStatus.value = t('settings.voice.mimoCloneAudioInvalid')
     input.value = ''
     return
   }
   if (file.size > MIMO_CLONE_AUDIO_MAX_BYTES) {
     console.warn('[VoiceSettings] MiMo clone audio is too large')
+    settingsStatus.value = t('settings.voice.mimoCloneAudioTooLarge')
     input.value = ''
     return
   }
 
-  const dataUri = await readFileAsDataUri(file)
-  vs.setMimoVoiceCloneDataUri(dataUri)
-  vs.setMimoVoiceCloneFileName(file.name)
-  vs.setMimoVoiceCloneFormat(inferCloneAudioFormat(file))
+  try {
+    const dataUri = await readFileAsDataUri(file)
+    vs.setMimoVoiceCloneDataUri(dataUri)
+    vs.setMimoVoiceCloneFileName(file.name)
+    vs.setMimoVoiceCloneFormat(inferCloneAudioFormat(file))
+    settingsStatus.value = ''
+  } catch (err) {
+    console.error('[VoiceSettings] Failed to read MiMo clone audio:', err)
+    settingsStatus.value = t('settings.voice.mimoCloneAudioReadFailed')
+    input.value = ''
+  }
 }
 
-function clearMimoCloneAudio() {
+async function clearMimoCloneAudio() {
+  const hadStoredClone = vs.mimoHasVoiceCloneData.value
   vs.setMimoVoiceCloneDataUri('')
   vs.setMimoVoiceCloneFileName('')
   vs.setMimoVoiceCloneFormat('wav')
   if (mimoCloneAudioInput.value) mimoCloneAudioInput.value.value = ''
+  if (!hadStoredClone) return
+  try {
+    const setting = await clearTtsSecret('mimo', 'voiceCloneDataUri')
+    await clearTtsSecret('mimo', 'voiceCloneFileName')
+    if (setting) vs.applyServerTtsSettings([setting])
+    vs.mimoHasVoiceCloneData.value = false
+    settingsStatus.value = t('settings.voice.mimoCloneAudioCleared')
+  } catch (err) {
+    console.error('[VoiceSettings] Failed to clear stored MiMo clone audio:', err)
+    settingsStatus.value = t('settings.voice.mimoCloneAudioClearFailed')
+  }
+}
+
+const settingsSaving = ref(false)
+const settingsStatus = ref('')
+
+onMounted(async () => {
+  try {
+    await vs.loadServerTtsSettings(true)
+  } catch (err) {
+    console.warn('[VoiceSettings] Failed to load server TTS settings:', err)
+  }
+})
+
+function buildProviderSettings(provider: StoredTtsProvider): TtsStoredSettings {
+  if (provider === 'openai') {
+    return {
+      baseUrl: vs.openaiBaseUrl.value,
+      model: vs.openaiModel.value,
+      voice: vs.openaiVoice.value,
+    }
+  }
+  if (provider === 'custom') {
+    return {
+      baseUrl: vs.customUrl.value,
+    }
+  }
+  if (provider === 'edge') {
+    return {
+      voice: vs.edgeVoice.value,
+      rate: speedToEdgeRate(vs.edgeRate.value),
+      pitch: hzToEdgePitch(vs.edgePitchHz.value),
+    }
+  }
+  const voiceMode = getMimoVoiceMode()
+  return {
+    baseUrl: vs.mimoBaseUrl.value,
+    authMode: vs.mimoAuthMode.value,
+    model: vs.mimoModel.value,
+    voiceMode,
+    voice: voiceMode === 'preset' ? vs.mimoVoice.value : undefined,
+    voiceDesignDesc: voiceMode === 'voiceDesign' ? vs.mimoVoiceDesignDesc.value || undefined : undefined,
+    voiceCloneFormat: voiceMode === 'voiceClone' ? vs.mimoVoiceCloneFormat.value : undefined,
+    stylePrompt: vs.mimoStylePrompt.value || undefined,
+  }
+}
+
+function buildProviderSecrets(provider: StoredTtsProvider): TtsStoredSecretsInput {
+  if (provider === 'openai') {
+    return vs.openaiApiKey.value ? { apiKey: vs.openaiApiKey.value } : {}
+  }
+  if (provider === 'custom') {
+    return vs.customApiKey.value ? { apiKey: vs.customApiKey.value } : {}
+  }
+  if (provider === 'mimo') {
+    const secrets: TtsStoredSecretsInput = {}
+    if (vs.mimoApiKey.value) secrets.apiKey = vs.mimoApiKey.value
+    if (vs.mimoVoiceCloneDataUri.value) {
+      secrets.voiceCloneDataUri = vs.mimoVoiceCloneDataUri.value
+      if (vs.mimoVoiceCloneFileName.value) secrets.voiceCloneFileName = vs.mimoVoiceCloneFileName.value
+    }
+    return secrets
+  }
+  return {}
+}
+
+async function clearStoredProviderSecret(provider: StoredTtsProvider, secretName: keyof TtsStoredSecretsInput) {
+  settingsSaving.value = true
+  settingsStatus.value = ''
+  try {
+    const setting = await clearTtsSecret(provider, secretName)
+    if (setting) vs.applyServerTtsSettings([setting])
+    if (provider === 'openai' && secretName === 'apiKey') {
+      vs.setOpenaiApiKey('')
+      vs.openaiHasApiKey.value = false
+      vs.openaiApiKeyPreview.value = ''
+    }
+    if (provider === 'custom' && secretName === 'apiKey') {
+      vs.setCustomApiKey('')
+      vs.customHasApiKey.value = false
+      vs.customApiKeyPreview.value = ''
+    }
+    if (provider === 'mimo' && secretName === 'apiKey') {
+      vs.setMimoApiKey('')
+      vs.mimoHasApiKey.value = false
+      vs.mimoApiKeyPreview.value = ''
+    }
+    settingsStatus.value = t('settings.voice.storedSecretCleared')
+  } catch (err) {
+    console.error('[VoiceSettings] Failed to clear stored TTS secret:', err)
+    settingsStatus.value = t('settings.voice.storedSecretClearFailed')
+  } finally {
+    settingsSaving.value = false
+  }
+}
+
+async function saveCurrentProviderSettings(): Promise<boolean> {
+  if (vs.provider.value === 'webspeech') {
+    settingsStatus.value = t('settings.voice.webspeechSettingsSaved')
+    return true
+  }
+  const provider = vs.provider.value as StoredTtsProvider
+  settingsSaving.value = true
+  settingsStatus.value = ''
+  try {
+    const setting = await saveTtsSettings(provider, {
+      settings: buildProviderSettings(provider),
+      secrets: buildProviderSecrets(provider),
+    })
+    vs.applyServerTtsSettings([setting])
+    settingsStatus.value = t('settings.voice.ttsSettingsSaved')
+    return true
+  } catch (err) {
+    console.error('[VoiceSettings] Failed to save server TTS settings:', err)
+    settingsStatus.value = t('settings.voice.ttsSettingsSaveFailed')
+    return false
+  } finally {
+    settingsSaving.value = false
+  }
 }
 
 async function handleTest() {
   const text = testText.value.trim()
   if (!text) return
+  if (vs.provider.value !== 'webspeech' && !(await saveCurrentProviderSettings())) return
   testPlaying.value = true
   try {
     if (vs.provider.value === 'webspeech') {
@@ -199,7 +343,6 @@ async function handleTest() {
       await speech.openaiPlay('__test__', text, {
         provider: 'openai',
         baseUrl: vs.openaiBaseUrl.value,
-        apiKey: vs.openaiApiKey.value || undefined,
         model: vs.openaiModel.value,
         voice: vs.openaiVoice.value,
       })
@@ -211,7 +354,6 @@ async function handleTest() {
       await speech.openaiPlay('__test__', text, {
         provider: 'custom',
         baseUrl: vs.customUrl.value,
-        apiKey: vs.customApiKey.value || undefined,
       })
     } else if (vs.provider.value === 'edge') {
       await speech.openaiPlay('__test__', text, {
@@ -222,14 +364,11 @@ async function handleTest() {
         pitch: hzToEdgePitch(vs.edgePitchHz.value),
       })
     } else if (vs.provider.value === 'mimo') {
-      if (!vs.mimoApiKey.value) {
-        console.warn('[VoiceSettings] MiMo API Key empty')
-        return
-      }
       await speech.mimoPlay('__test__', text, buildMimoTtsOptions())
     }
   } catch (err) {
     console.error('[VoiceSettings] Test failed:', err)
+    settingsStatus.value = t('settings.voice.testFailed', { error: getErrorMessage(err) })
   } finally {
     testPlaying.value = false
   }
@@ -289,6 +428,18 @@ async function handleTest() {
           placeholder="sk-..."
           @update:value="vs.setOpenaiApiKey"
         />
+        <div v-if="vs.openaiHasApiKey.value || vs.openaiApiKey.value" class="secret-status">
+          {{ t('settings.voice.storedServerKey', { value: vs.openaiApiKey.value ? t('settings.voice.secretPendingSave') : vs.openaiApiKeyPreview.value }) }}
+          <NButton
+            v-if="vs.openaiHasApiKey.value"
+            size="tiny"
+            tertiary
+            :disabled="settingsSaving"
+            @click="clearStoredProviderSecret('openai', 'apiKey')"
+          >
+            {{ t('settings.voice.clearStoredKey') }}
+          </NButton>
+        </div>
       </SettingRow>
 
       <SettingRow
@@ -364,6 +515,18 @@ async function handleTest() {
           :placeholder="t('settings.voice.customApiKeyPlaceholder')"
           @update:value="vs.setCustomApiKey"
         />
+        <div v-if="vs.customHasApiKey.value || vs.customApiKey.value" class="secret-status">
+          {{ t('settings.voice.storedServerKey', { value: vs.customApiKey.value ? t('settings.voice.secretPendingSave') : vs.customApiKeyPreview.value }) }}
+          <NButton
+            v-if="vs.customHasApiKey.value"
+            size="tiny"
+            tertiary
+            :disabled="settingsSaving"
+            @click="clearStoredProviderSecret('custom', 'apiKey')"
+          >
+            {{ t('settings.voice.clearStoredKey') }}
+          </NButton>
+        </div>
       </SettingRow>
 
 
@@ -445,6 +608,18 @@ async function handleTest() {
           :placeholder="t('settings.voice.mimoApiKeyPlaceholder')"
           @update:value="vs.setMimoApiKey"
         />
+        <div v-if="vs.mimoHasApiKey.value || vs.mimoApiKey.value" class="secret-status">
+          {{ t('settings.voice.storedServerKey', { value: vs.mimoApiKey.value ? t('settings.voice.secretPendingSave') : vs.mimoApiKeyPreview.value }) }}
+          <NButton
+            v-if="vs.mimoHasApiKey.value"
+            size="tiny"
+            tertiary
+            :disabled="settingsSaving"
+            @click="clearStoredProviderSecret('mimo', 'apiKey')"
+          >
+            {{ t('settings.voice.clearStoredKey') }}
+          </NButton>
+        </div>
       </SettingRow>
 
       <SettingRow
@@ -540,8 +715,11 @@ async function handleTest() {
           <span v-if="vs.mimoVoiceCloneFileName.value" class="clone-audio-name">
             {{ vs.mimoVoiceCloneFileName.value }} · {{ vs.mimoVoiceCloneFormat.value }}
           </span>
+          <span v-else-if="vs.mimoHasVoiceCloneData.value" class="clone-audio-name">
+            {{ t('settings.voice.storedOnServer') }}
+          </span>
           <NButton
-            v-if="vs.mimoVoiceCloneDataUri.value"
+            v-if="vs.mimoVoiceCloneDataUri.value || vs.mimoHasVoiceCloneData.value"
             size="small"
             tertiary
             @click="clearMimoCloneAudio"
@@ -590,6 +768,18 @@ async function handleTest() {
           {{ testPlaying ? t('settings.voice.testButtonPlaying') : t('settings.voice.testButton') }}
         </NButton>
       </div>
+      <div class="test-row settings-save-row">
+        <NButton
+          size="small"
+          type="primary"
+          :loading="settingsSaving"
+          :disabled="settingsSaving"
+          @click="saveCurrentProviderSettings"
+        >
+          {{ t('settings.voice.saveTtsSettings') }}
+        </NButton>
+        <span v-if="settingsStatus" class="settings-status">{{ settingsStatus }}</span>
+      </div>
     </div>
   </div>
 </template>
@@ -622,6 +812,10 @@ async function handleTest() {
     gap: 8px;
     align-items: center;
   }
+
+  .settings-save-row {
+    margin-top: 8px;
+  }
 }
 
 .slider-row {
@@ -646,6 +840,13 @@ async function handleTest() {
 
 .hidden-file-input {
   display: none;
+}
+
+.secret-status,
+.settings-status {
+  font-size: 12px;
+  color: #888;
+  margin-top: 4px;
 }
 
 .clone-audio-name {
